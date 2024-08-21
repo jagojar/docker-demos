@@ -1,0 +1,95 @@
+name: Build and Deploy to AKS
+on:
+  push:
+    branches:
+      - master
+
+env:
+  RESOURCEGROUPNAME: "<resource-group-name>"
+  REGISTRYNAME: "<acr-name>"
+  CLUSTERNAME: "aks-k8s-cluster"
+  NAMESPACE: "github"
+
+jobs:
+  build:
+    name: Build and push image to container registry
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+     
+    - name: Build and push image to ACR
+      id: build-image
+      run: |
+        echo "::add-mask::${{ steps.createACR.outputs.acr_password }}"
+        docker login ${{ env.REGISTRYNAME }}.azurecr.io --username ${{ env.REGISTRYNAME }} --password ${{ secrets.ACR_SECRET }}
+        docker build "$GITHUB_WORKSPACE/mywebapi" -f  "mywebapi/Dockerfile" -t ${{ env.REGISTRYNAME }}.azurecr.io/demo-webapi:${{ github.run_id }}
+        docker build "$GITHUB_WORKSPACE/mywebapp" -f  "mywebapp/Dockerfile" -t ${{ env.REGISTRYNAME }}.azurecr.io/demo-webapp:${{ github.run_id }}
+        docker push ${{ env.REGISTRYNAME }}.azurecr.io/demo-webapi:${{ github.run_id }}
+        docker push ${{ env.REGISTRYNAME }}.azurecr.io/demo-webapp:${{ github.run_id }}
+        
+  deploy:
+    name: Deploy application to AKS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    # login to azure
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Get AKS Credentials
+      id: getContext
+      run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCEGROUPNAME }} --name ${{ env.CLUSTERNAME }} --file $GITHUB_WORKSPACE/kubeconfig
+          echo "KUBECONFIG=$GITHUB_WORKSPACE/kubeconfig" >> $GITHUB_ENV
+
+    - name: Create namespace
+      run: |
+        namespacePresent=`kubectl get namespace | grep ${{ env.NAMESPACE }} | wc -l`
+        if [ $namespacePresent -eq 0 ]
+        then
+            echo `kubectl create namespace ${{ env.NAMESPACE }}`
+        fi
+        
+    - uses: azure/k8s-create-secret@v1
+      with:
+        namespace: ${{ env.NAMESPACE }}
+        container-registry-url: ${{ env.REGISTRYNAME }}.azurecr.io
+        container-registry-username: ${{ env.REGISTRYNAME }}
+        container-registry-password: ${{ secrets.ACR_SECRET }}
+        secret-name: ${{ env.CLUSTERNAME }}dockerauth
+
+    - name: Replace build number in backend-webapi.yaml file
+      run: bash -c "sed -i 's/BuildNumber/${{ github.run_id }}/g'  backend-webapi.yaml"
+    - name: Replace build number in frontend-webapp.yaml file
+      run: bash -c "sed -i 's/BuildNumber/${{ github.run_id }}/g'  frontend-webapp.yaml"
+      
+    - name: 'Publish Artifact: frontend-webapp.yaml'
+      uses: actions/upload-artifact@v2
+      with:
+        path: frontend-webapp.yaml
+        name: frontend-webapp
+    - name: 'Publish Artifact: backend-webapi.yaml'
+      uses: actions/upload-artifact@v2
+      with:
+        path: backend-webapi.yaml
+        name: backend-webapi
+        
+    - uses: azure/k8s-deploy@v1
+      with:
+        namespace: ${{ env.NAMESPACE }}
+        manifests: |
+            frontend-webapp.yaml
+            backend-webapi.yaml
+        images: |
+          ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.run_id }}
+        imagepullsecrets: |
+          ${{ env.CLUSTERNAME }}dockerauth
+
+    - name : Cleanup
+      run: | 
+        az logout
+        rm -rf $GITHUB_WORKSPACE/kubeconfig
